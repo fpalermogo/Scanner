@@ -110,6 +110,7 @@ const LECTOR_URL = '';
 
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const esDeRed = e => e && (e.name === 'TypeError' || /Failed to fetch|Load failed|NetworkError/i.test(e.message || ''));
 const pesos = n => n === null || n === undefined || n === '' ? '' : Number(n).toLocaleString('es-AR', {minimumFractionDigits: 2, maximumFractionDigits: 2});
 const medioTxt = m => ({'ANDREANI': 'Andreani', 'VIA RED': 'Vía Red'})[m] || m;
 const hoy = () => { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); };
@@ -138,10 +139,20 @@ function toast(t, error) {
 }
 
 // ---------------------------------------------------------------- servidor (Apps Script doPost)
-async function llamar(datos) {
-  const r = await fetch(URL_LECTOR, { method: 'POST', body: JSON.stringify(Object.assign({ tok: CODIGO }, datos)) });
-  if (!r.ok) throw new Error('El lector respondió ' + r.status);
-  const j = await r.json();
+async function llamar(datos, segundos) {
+  const corte = new AbortController();
+  const reloj = setTimeout(() => corte.abort(), (segundos || 45) * 1000);
+  let r;
+  try {
+    r = await fetch(URL_LECTOR, { method: 'POST', body: JSON.stringify(Object.assign({ tok: CODIGO }, datos)),
+      redirect: 'follow', cache: 'no-store', signal: corte.signal });
+  } catch (e) {
+    if (e.name === 'AbortError') { const t = new Error('El lector tardó demasiado'); t.transitorio = true; throw t; }
+    throw e;
+  } finally { clearTimeout(reloj); }
+  if (!r.ok) { const e = new Error('El lector respondió ' + r.status); e.transitorio = r.status === 404 || r.status >= 500; throw e; }
+  let j;
+  try { j = await r.json(); } catch (x) { const e = new Error('Respuesta inválida del lector'); e.transitorio = true; throw e; }
   if (!j.ok) { const e = new Error(j.error || 'Error'); e.sinAcceso = j.sinAcceso; throw e; }
   return j.datos;
 }
@@ -173,7 +184,7 @@ $('#cfgEntrar').onclick = async () => {
     mostrar();
   } catch (e) {
     CODIGO = '';
-    toast(e.message === 'Failed to fetch' ? 'No se pudo conectar con el lector. Revisá la dirección y la señal.' : e.message, true);
+    toast(esDeRed(e) ? 'No se pudo conectar con el lector. Revisá que la implementación del celular tenga acceso "Cualquier usuario" y que la dirección sea la nueva /exec.' : e.message, true);
   }
   $('#cfgEntrar').disabled = false;
 };
@@ -215,7 +226,7 @@ function dibujarLista() {
     const imp = f ? f.importe : s.importe;
     const ic = { pendiente: '<span class="cargando"></span>', ok: '<span class="ok">✓</span>', faltan: '<span class="rev">!</span>', duplicado: '<span class="rev">⚠</span>', error: '<span class="mal">✕</span>' }[i.estado];
     const fecha = f && f.fecha_envio ? f.fecha_envio.split('-').reverse().join('/') : '';
-    const detalle = i.estado === 'pendiente' ? 'Enviando…' :
+    const detalle = i.estado === 'pendiente' ? (i.intentos ? `Reintentando (${i.intentos})… ${esc(i.error || '')}` : 'Enviando…') :
       i.estado === 'error' ? esc(i.error || 'Error') :
       i.estado === 'duplicado' ? `Ya se registró el ${esc(fecha)}${f && f.medio ? ' por ' + esc(medioTxt(f.medio)) : ''}` :
       i.estado === 'faltan' ? `${esc(f.obra_social || 'Obra social sin cargar')} · faltan datos de envío (completar en la PC)` :
@@ -230,7 +241,7 @@ function dibujarLista() {
   });
   document.querySelectorAll('[data-reintentar]').forEach(b => b.onclick = () => {
     const i = ITEMS.find(x => x.id === b.dataset.reintentar);
-    i.estado = 'pendiente'; persistir(); enviarPendientes();
+    i.estado = 'pendiente'; i.intentos = 1; persistir(); enviarPendientes();
   });
 }
 
@@ -250,10 +261,19 @@ async function enviarPendientes() {
     try {
       const r = await llamar({ accion: 'escanear', texto: i.texto, fecha: i.fecha, envio: i.envio, forzar: !!i.forzar });
       i.res = r;
-      i.estado = r.duplicado ? 'duplicado' : (r.fila.estado === 'OK' ? 'ok' : 'faltan');
-      if (r.duplicado) pitido('rev');
+      // Si un intento anterior llegó al lector pero la respuesta se perdió, ahora vuelve como "ya registrada": es la misma.
+      const eraMia = r.duplicado && i.intentos && !i.forzar;
+      i.estado = r.duplicado && !eraMia ? 'duplicado' : (r.fila.estado === 'OK' ? 'ok' : 'faltan');
+      if (i.estado === 'duplicado') pitido('rev');
     } catch (e) {
-      if (e.message === 'Failed to fetch' || e.name === 'TypeError') { sinRed = true; break; }   // sin señal: queda pendiente
+      if (esDeRed(e) && !navigator.onLine) { sinRed = true; break; }   // sin señal: queda pendiente
+      if (esDeRed(e) || e.transitorio) {   // falla pasajera: se reintenta sola
+        i.intentos = (i.intentos || 0) + 1;
+        i.error = e.message;
+        if (i.intentos >= 6) { i.estado = 'error'; pitido('mal'); } else sinRed = true;
+        persistir();
+        continue;
+      }
       if (e.sinAcceso) { toast(e.message + ' Pedí un código nuevo.', true); CODIGO = ''; guardar('codigo', ''); enviando = false; mostrar(); return; }
       i.estado = 'error'; i.error = e.message;
       pitido('mal');
@@ -261,7 +281,7 @@ async function enviarPendientes() {
     persistir();
   }
   enviando = false;
-  if (sinRed) setTimeout(enviarPendientes, 15000);
+  if (sinRed) setTimeout(enviarPendientes, 8000);
 }
 window.addEventListener('online', enviarPendientes);
 
